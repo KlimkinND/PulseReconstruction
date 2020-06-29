@@ -1,9 +1,10 @@
 using LinearAlgebra, FFTW, Plots, Dates, ProgressMeter
 
-using CuArrays, CUDAnative, CUDAdrv
+#using CuArrays, CUDAnative, CUDAdrv
+using CUDA
 using StaticArrays
-using UnsafeArrays
-using Suppressor
+#using UnsafeArrays
+#using Suppressor
 
 println("$(Threads.nthreads()) threads")
 BLAS.set_num_threads(32)
@@ -16,7 +17,7 @@ const ω = 0.8
 const T = 2π/ω
 const τ1 = Inf#2T
 const τ2 = T/2
-const N_cycles = 5
+const N_cycles = 10
 const Σ = T*N_cycles/10
 const μ = T*N_cycles/2
 const Tmax = N_cycles*T
@@ -35,19 +36,19 @@ const dτ = dt/Nph
 const Φ = range(0.0, stop=2π, length=Nf+1)[1:end-1] |> cu
 
 const β = 2.0
-smclamp(x, a, b) = (c = 0.5*(a+b); w = 0.5*(b-a); z=(x-c)/w; c + w*CUDAnative.tanh(CUDAnative.sinh(β*z)/β))
+smclamp(x, a, b) = (c = 0.5*(a+b); w = 0.5*(b-a); z=(x-c)/w; c + w*CUDA.tanh(CUDA.sinh(β*z)/β))
 const maxint = Tmax/2
 const fwhm = Tmax/2
 
-#EF(t) = CUDAnative.exp(-(t-μ)^2/(2Σ^2))
+#EF(t) = CUDA.exp(-(t-μ)^2/(2Σ^2))
 
 if mode == "2h"
     EF(t) = 1.0 - smclamp((t-(maxint+fwhm/4))/(fwhm/2), 0.0, 1.0) - smclamp(-(t-(maxint-fwhm/4))/(fwhm/2), 0.0, 1.0)
-    A(φ::Float64, t::Float64) = EF(t)*f*(CUDAnative.sin(ω*t) + q*CUDAnative.sin(2ω*t+φ)/2)/ω
+    A(φ::Float64, t::Float64) = EF(t)*f*(CUDA.sin(ω*t) + q*CUDA.sin(2ω*t+φ)/2)/ω
 elseif mode == "cep"
-    const F0 = 0.1
-    EF(t) = CUDAnative.exp(-(t-μ)^2/(2Σ^2))
-    A(φ::Float64, t::Float64) = EF(t)*f*CUDAnative.sin(ω*t+φ)/ω + F0*t
+    const F0 = 0.0
+    EF(t) = CUDA.exp(-(t-μ)^2/(2Σ^2))
+    A(α::Float64, φ::Float64, t::Float64) = EF(t)*f*CUDA.sin(ω*t+φ+α*ω*(t-μ)^2/4Σ)/ω# + F0*t
 end
 @inline F(φ::Float64, t::Float64) = EF(t)*f*(cos(ω*t) + q*cos(2ω*t+φ))
 
@@ -59,11 +60,11 @@ const σ = [σx, σy, σz]
 function gen_U!(U, M, G, V, VC)
     mul!(VC, G, V) #V3 == [0.0, 1.0]
 
-    @inbounds eϕ = VC[1]/CUDAnative.abs(VC[1])
-    @inbounds cθ = VC[2]/CUDAnative.sqrt(CUDAnative.abs2(VC[2]) + CUDAnative.abs2(VC[1]))
+    @inbounds eϕ = VC[1]/CUDA.abs(VC[1])
+    @inbounds cθ = VC[2]/CUDA.sqrt(CUDA.abs2(VC[2]) + CUDA.abs2(VC[1]))
 
-    cθ2 = CUDAnative.sqrt((1+cθ)/2)
-    sθ2 = CUDAnative.sqrt((1-cθ)/2)
+    cθ2 = CUDA.sqrt((1+cθ)/2)
+    sθ2 = CUDA.sqrt((1-cθ)/2)
 
     @inbounds U[1,1] = cθ2
     @inbounds U[2,1] = -sθ2*eϕ
@@ -81,7 +82,7 @@ const hid = ρ0
 #Nsp = 16
 const N_pars = 2^16
 #const N_pars = Nsp*Nsp
-const ord = 6
+const ord = 4
 const pars_bsl = [4.0, -1.0, 1.5, 1.0, 0.5, 0.5][1:ord]
 const pars_spr = [4.0, -5.0, -3.0, -2.0, -1.0, -1.0][1:ord]
 
@@ -97,18 +98,22 @@ end
 const pars = copy(pars_raw)
 if mode == "cep"
     const cep = 2π.*Base.rand(N_pars) |> cu
+    const chp = (-1.0 .+ 2.0 .* CUDA.rand(N_pars)).*0.5
 else
-    const cep = CuArrays.zeros(N_pars)
+    const cep = CUDA.zeros(N_pars)
 end
 
-ht = zeros(2, 2, ord, N_pars)
+ht = zeros(ComplexF64, 2, 2, ord, N_pars)
+htr = zeros(ComplexF64, 2, 2, ord, N_pars)
 for i=1:N_pars
     for j=1:ord
-        ht[:,:,j,i] = pars[j, i]*σz + real(dips[j])*σx + imag(dips[j])*σy
+        ht[:,:,j,i] = pars[j, i]*σz + (real(dips[j])*σx + imag(dips[j])*σy) /2
+        htr[:,:,j,i] = (-imag(dips[j])*σx + real(dips[j])*σy) /2 #switch to one-sided connections!
     end
 end
 
 const Ht = cu(ht)
+const Htr = cu(htr)
 
 const freqs = (2π/Ts[end]).*collect(0:div(length(Ts), 2))
 
@@ -127,7 +132,7 @@ function gen_G!(G, M, ht_par, κ, ord)#, ::Val{ord}) where {ord}
         for a=1:2, b=1:2
             @inbounds M[a, b] = ht_par[a,b,x]
         end
-        lmul!(CUDAnative.cos(κ*(x-1)), M)
+        lmul!(CUDA.cos(κ*(x-1)), M)
         for a=1:2, b=1:2
             @inbounds G[a, b] += M[a, b]
         end
@@ -143,7 +148,7 @@ function gen_J!(J, M, ht_par, κ, ord)
         for a=1:2, b=1:2
             @inbounds M[a, b] = ht_par[a,b,x]
         end
-        lmul!(-CUDAnative.sin(κ*(x-1))*(x-1), M)
+        lmul!(-CUDA.sin(κ*(x-1))*(x-1), M)
         for a=1:2, b=1:2
             @inbounds J[a, b] += M[a, b]
         end
@@ -177,7 +182,7 @@ end
 
 const ν = 4
 
-function statsimkern!(cep, js, hts, ::Val{Z}, ::Val{ORD}, ::Val{ν}, exc) where {Z} where {ORD}
+function statsimkern!(chp, cep, js, hts, htr, ::Val{Z}, ::Val{ORD}, ::Val{ν}, exc) where {Z} where {ORD}
     #i = threadIdx().x
     #j = threadIdx().y
     k_id = threadIdx().x
@@ -197,6 +202,8 @@ function statsimkern!(cep, js, hts, ::Val{Z}, ::Val{ORD}, ::Val{ν}, exc) where 
     @inbounds ρ0[1, 1] = 1.0
 
     HT = @MArray zeros(ComplexF64, Z, Z, ORD)
+    HTR = @MArray zeros(ComplexF64, Z, Z, ORD)
+
     ID = @MMatrix [(a == b ? 1.0 : 0.0) for a=1:2, b=1:2]
 
     V = @MVector zeros(ComplexF64, Z)
@@ -210,21 +217,29 @@ function statsimkern!(cep, js, hts, ::Val{Z}, ::Val{ORD}, ::Val{ν}, exc) where 
         for i=k_id:k_stride:Nk, j=φ_id:φ_stride:Nf, q=block_id:block_stride:N_pars
             @inbounds k = K[i]
             @inbounds φ = cep[q] + Φ[j]
+            @inbounds α = chp[q]
 
             for a=1:Z, b=1:Z, x=1:ORD
                 @inbounds HT[a, b, x] = hts[a,b,x,q]
             end
 
-            fill!(G, 0f0)
-            for x=1:ORD, a=1:Z, b=1:Z
-                @inbounds G[a, b] += HT[a,b,x]*CUDAnative.cos(k*(x-1))
+            for a=1:Z, b=1:Z, x=1:ORD
+                @inbounds HTR[a, b, x] = htr[a,b,x,q]
             end
 
-            eϕ = @inbounds G[2, 1]/CUDAnative.abs(G[1, 2])
-            cθ = @inbounds G[2, 2]/CUDAnative.sqrt(CUDAnative.abs2(G[1, 2]) + CUDAnative.abs2(G[2, 2])) |> real
+            fill!(G, 0f0)
+            for x=1:ORD, a=1:Z, b=1:Z
+                @inbounds G[a, b] += HT[a,b,x]*CUDA.cos(k*(x-1))
+            end
+            for x=1:ORD, a=1:Z, b=1:Z
+                @inbounds G[a, b] += HTR[a,b,x]*CUDA.sin(k*(x-1))
+            end
 
-            cθ2 = CUDAnative.sqrt((1f0+cθ)*0.5f0)
-            sθ2 = CUDAnative.sqrt((1f0-cθ)*0.5f0)
+            eϕ = @inbounds G[2, 1]/CUDA.abs(G[1, 2])
+            cθ = @inbounds G[2, 2]/CUDA.sqrt(CUDA.abs2(G[1, 2]) + CUDA.abs2(G[2, 2])) |> real
+
+            cθ2 = CUDA.sqrt((1f0+cθ)*0.5f0)
+            sθ2 = CUDA.sqrt((1f0-cθ)*0.5f0)
 
             @inbounds U[1,1] = -cθ2#-cθ2
             @inbounds U[1,2] = sθ2
@@ -240,7 +255,10 @@ function statsimkern!(cep, js, hts, ::Val{Z}, ::Val{ORD}, ::Val{ν}, exc) where 
                 fill!(J, 0f0)
 
                 for x=1:ORD, a=1:Z, b=1:Z
-                    @inbounds J[a, b] += -HT[a,b,x]*CUDAnative.sin((k + A(φ, t))*(x-1))*(x-1)
+                    @inbounds J[a, b] += -HT[a,b,x]*CUDA.sin((k + A(α, φ, t))*(x-1))*(x-1)
+                end
+                for x=1:ORD, a=1:Z, b=1:Z
+                    @inbounds J[a, b] += HTR[a,b,x]*CUDA.cos((k + A(α, φ, t))*(x-1))*(x-1)
                 end
 
                 mul!(M, J, ρ)
@@ -251,33 +269,23 @@ function statsimkern!(cep, js, hts, ::Val{Z}, ::Val{ORD}, ::Val{ν}, exc) where 
                     fill!(G, 0f0)
 
                     for x=1:ORD, a=1:Z, b=1:Z
-                        @inbounds G[a, b] += dτ*HT[a,b,x]*CUDAnative.cos((k + A(φ, t+τ))*(x-1))/ν
+                        @inbounds G[a, b] += dτ*HT[a,b,x]*CUDA.cos((k + A(α, φ, t+τ))*(x-1))/ν
+                    end
+                    for x=1:ORD, a=1:Z, b=1:Z
+                        @inbounds G[a, b] += dτ*HTR[a,b,x]*CUDA.sin((k + A(α, φ, t+τ))*(x-1))/ν
                     end
 
-                    @inbounds δ = CUDAnative.abs2(G[2,2])
-                    @inbounds ϵ = CUDAnative.abs2(G[1,2])
-                    σ = CUDAnative.sqrt(δ+ϵ)
+                    @inbounds δ = CUDA.abs2(G[2,2])
+                    @inbounds ϵ = CUDA.abs2(G[1,2])
+                    σ = CUDA.sqrt(δ+ϵ)
 
-                    R .= ID.*CUDAnative.cos(σ) .+ G .* (1im*CUDAnative.sin(σ)/σ)
+                    R .= ID.*CUDA.cos(σ) .+ G .* (1im*CUDA.sin(σ)/σ)
 
-                    if false && τ == 0.0 && i == 1 && j == 1 && q == 1
-                        @cuprintf("%lf\n", k+A(φ, t+τ))
-                        for a=1:2, b=1:2
-                            @inbounds @cuprintf("%lf ", real(G[a, b])*ν/dτ)
-                        end
-                        @cuprintf("\n")
-                        for a=1:2, b=1:2
-                            @inbounds @cuprintf("%lf ", real(ρ[a, b]))
-                        end
-                        @cuprintf("\n")
-                        @cuprintf("\n")
-                    end
+                    eϕ = @inbounds G[2, 1]/CUDA.abs(G[1, 2])
+                    cθ = @inbounds G[2, 2]/CUDA.sqrt(CUDA.abs2(G[1, 2]) + CUDA.abs2(G[2, 2])) |> real
 
-                    eϕ = @inbounds G[2, 1]/CUDAnative.abs(G[1, 2])
-                    cθ = @inbounds G[2, 2]/CUDAnative.sqrt(CUDAnative.abs2(G[1, 2]) + CUDAnative.abs2(G[2, 2])) |> real
-
-                    cθ2 = CUDAnative.sqrt((1f0+cθ)*0.5f0)
-                    sθ2 = CUDAnative.sqrt((1f0-cθ)*0.5f0)
+                    cθ2 = CUDA.sqrt((1f0+cθ)*0.5f0)
+                    sθ2 = CUDA.sqrt((1f0-cθ)*0.5f0)
 
                     @inbounds U[1,1] = -cθ2#-cθ2
                     @inbounds U[1,2] = sθ2
@@ -311,10 +319,10 @@ function statsimkern!(cep, js, hts, ::Val{Z}, ::Val{ORD}, ::Val{ν}, exc) where 
 end
 
 out = zeros(ComplexF64, length(freqs), Nf, N_pars)
-out_J = CuArrays.zeros(Float64, length(Ts), Nf, N_pars)
+out_J = CUDA.zeros(Float64, length(Ts), Nf, N_pars)
 
 @time begin
-    @cuda threads=(1, 1) blocks=1 statsimkern!(cep, out_J, Ht, Val(2), Val(ord), Val(ν), false);
+    @cuda threads=(1, 1) blocks=1 statsimkern!(chp, cep, out_J, Ht, Htr, Val(2), Val(ord), Val(ν), false);
     Array(out_J)
 end
 
@@ -323,7 +331,7 @@ out_J .= 0.0
 df = Dates.format(now(), "ddmm_HHMM")
 
 @time begin
-    @sync @cuda threads=(8, 8) blocks=512 statsimkern!(cep, out_J, Ht, Val(2), Val(ord), Val(ν), true);
+    @sync @cuda threads=(8, 8) blocks=512 statsimkern!(chp, cep, out_J, Ht, Htr, Val(2), Val(ord), Val(ν), true);
     Array(Ht)
 end
 
@@ -333,7 +341,7 @@ const chunk_size = Int(round(sqrt(N_pars)))
 const inds = Iterators.partition(1:N_pars, chunk_size)
 
 out_Jω = zeros(1+hmax*N_cycles, Nf, N_pars)
-proc_J = CuArrays.zeros(length(Ts), Nf, chunk_size)
+proc_J = CUDA.zeros(length(Ts), Nf, chunk_size)
 
 if mode == "2h"
     @showprogress for ind=inds
@@ -377,4 +385,5 @@ jldopen("resps-$mode-$df.jld2", true, true, true, IOStream) do io
     write(io, "phi", Φ)
     write(io, "N", N_cycles)
     write(io, "pars", prs)
+    write(io, "chirp", Array(chp))
 end
