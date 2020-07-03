@@ -82,7 +82,7 @@ const hid = ρ0
 #Nsp = 16
 const N_pars = 2^16
 #const N_pars = Nsp*Nsp
-const ord = 4
+const ord = 6
 const pars_bsl = [4.0, -1.0, 1.5, 1.0, 0.5, 0.5][1:ord]
 const pars_spr = [4.0, -5.0, -3.0, -2.0, -1.0, -1.0][1:ord]
 
