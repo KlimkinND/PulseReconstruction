@@ -355,7 +355,7 @@ jldopen("resps-$mode-$df.jld2", true, true, true, IOStream) do io
     elseif mode == "cep"
         write(io, "data_freq", Float64.(abs.(out_Jω)))
         write(io, "cep", Array(cep))
-        write(io, "cbp", Array(cbp))
+        write(io, "cbp", Array(cbp))#
         write(io, "chirp", Array(chp))
         write(io, "out_Js", out_Js)
     end
