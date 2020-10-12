@@ -362,7 +362,7 @@ jldopen("resps-$mode-$df.jld2", true, true, true, IOStream) do io
     write(io, "freqs", freqs)
     write(io, "omega0", ω)
     write(io, "T", Ts)
-    write(io, "phi", Φ)
+    write(io, "phi", Φ)###
     write(io, "N", N_cycles)
     if ssh
         write(io, "delta", δ)
