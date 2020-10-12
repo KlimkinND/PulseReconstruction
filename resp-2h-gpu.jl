@@ -3,38 +3,35 @@ using LinearAlgebra, FFTW, Plots, Dates, ProgressMeter
 using CUDA
 using StaticArrays
 
-println("$(Threads.nthreads()) threads")
 BLAS.set_num_threads(32)
 
-const mode = "cep"
-const ssh = false
+const mode = "cep" #change to measure response vs. phase of 2nd harmonic; necessary functionality currently broken
+const ssh = false #SSH chain or tight-binding crystal
 
-const f = 4.0
-const q = 0.1
-const ω = 0.8
+const f = 4.0 #field strength, F_0 in the paper
+const q = 0.1 #only used for 2nd harmonic measurements
+const ω = 0.8 #field frequency in eV
 const T = 2π/ω
 const τ1 = Inf
-const τ2 = T/2
-const N_cycles = 40
+const τ2 = T/2 #dephasing time
+const N_cycles = 40 #from start to end of the simulation
 const Σ = T
-const t0 = T*N_cycles/2
+const t0 = T*N_cycles/2 #pulse peak time
 const Tmax = N_cycles*T
 const z = 2
 
-const Nk = 32
-const Nf = 64
-const hmax = 40
+const Nk = 32 #number of k-points in the Brillouin zone
+const Nf = 64 #number of delay phases for which the responses are measured
+const hmax = 40 #maximum harmonic number measured
 const K = range(0, stop=2π, length=Nk+1)[1:end-1] |> cu
 const Ts = range(0.0, stop=Tmax, length=2*hmax*N_cycles+1) |> cu
-const Nph = 2
+const Nph = 2 #intermediate integration steps
 const dt = Tmax/(2*hmax*N_cycles)
 const τs = range(0.0, stop=dt, length=Nph+1)[1:end-1] |> cu
 const dτ = dt/Nph
 const Φ = range(0.0, stop=2π, length=Nf+1)[1:end-1] |> cu
-const ξ = 2.0
+const ξ = 2.0 #smoothing parameter for the cutoff
 
-const β = 2.0
-smclamp(x, a, b) = (c = 0.5*(a+b); w = 0.5*(b-a); z=(x-c)/w; c + w*CUDA.tanh(CUDA.sinh(β*z)/β))
 const maxint = Tmax/2
 const fwhm = Tmax/2
 
@@ -43,7 +40,7 @@ cusin(x::ComplexF64) = CUDA.imag(CUDA.exp(1im*x))
 cucos(x::ComplexF64) = CUDA.real(CUDA.exp(1im*x))
 cupow(x::ComplexF64, p::Float64) = CUDA.pow(CUDA.abs(x), p)*CUDA.exp(1.0im*p*CUDA.angle(x))
 
-function airy_asym(y::ComplexF64, n::Int, corr::ComplexF64 = zero(ComplexF64))
+function airy_asym(y::ComplexF64, n::Int, corr::ComplexF64 = zero(ComplexF64)) #see DLMF 9.7.5, 9.7.9 https://dlmf.nist.gov/9.7
     ret = 0.0
     if CUDA.abs(CUDA.angle(y)) < 2π/3
         z = y |> ComplexF64
@@ -74,7 +71,7 @@ function airy_asym(y::ComplexF64, n::Int, corr::ComplexF64 = zero(ComplexF64))
     return ret/(sqrt(π)*cupow(z, 0.25))
 end
 
-function airy_taylor(z::ComplexF64, n::Int=40)
+function airy_taylor(z::ComplexF64, n::Int=40) #see DLMF 9.4.1 https://dlmf.nist.gov/9.4
     cf = 0
     for k = 0:n
         cf += CUDA.exp(CUDA.lgamma((k+1.0)/3) - CUDA.lgamma(k+1.0))*CUDA.sinpi(2*(k+1.0)/3)*cupow(CUDA.pow(3.0, 1/3)*z, Float64(k))
@@ -82,7 +79,7 @@ function airy_taylor(z::ComplexF64, n::Int=40)
     return (1.0/(CUDA.pow(3.0, 2/3)*π))*cf
 end
 
-function airy_gpu(z::ComplexF64, corr::ComplexF64, n1::Int64=20, n2::Int=1, r::Float64=2.5)
+function airy_gpu(z::ComplexF64, corr::ComplexF64, n1::Int64=20, n2::Int=1, r::Float64=2.5) #default parameters yield inaccurate results; redefined manually in EF
     if CUDA.abs(z) < r
         return airy_taylor(z, n1)*CUDA.exp(corr)
     else
@@ -98,7 +95,7 @@ if mode == "2h"
 elseif mode == "cep"
     const F0 = 0.0
     cutf(t) = (t > ξ*T ? 1.0 : CUDA.exp(-(t-ξ*T)^2 /(2(ξ*T/4)^2)))
-    function EF(ϵ::Float64, β::Float64, z::Float64)
+    function EF(ϵ::Float64, β::Float64, z::Float64) #envelope function
         α = β*π*(Σ/2)^2
         λ = ComplexF64(ϵ*π*Σ^3)
         Σc = sqrt(Σ^2 + α^2/Σ^2)
@@ -124,24 +121,24 @@ const ρ0 = (x = zeros(ComplexF64, z, z); x[1, 1] = 1.0; x) |> cu
 const idm = ComplexF64.(Matrix(I, z, z))
 const hid = ρ0
 
-const N_pars = 2^18
-const ord = 4
+const N_pars = 2^18 #number of samples to be generated
+const ord = 4 #maximum hopping order
 const pars_bsl = [4.0, -1.0, 1.5, 1.0, 0.5, 0.5][1:ord]
-const pars_spr = [4.0, -5.0, -3.0, -2.0, -1.0, -1.0][1:ord]
+const pars_spr = [4.0, -5.0, -3.0, -2.0, -1.0, -1.0][1:ord] #parameter t[i] ranges from pars_bsl[i] to pars_bsl[i]+pars_spr[i]
 
 @assert length(pars_bsl) == length(pars_spr) == ord
 κ = range(-π, stop=π, length=101)
 
-const dips = (x = [0.0, 0.05]; vcat(x, zeros(ord-length(x)))) |> cu
+const dips = (x = [0.0, 0.01]; vcat(x, zeros(ord-length(x)))) |> cu #h[i]; set to h_{i≂̸1} = 0, h_1=0.01 eV
 pars_raw = pars_bsl .+ pars_spr.*rand(ord, N_pars)
 Threads.@threads for j=1:N_pars
     pars_raw[1, j] -= minimum([sum(pars_raw[i,j]*cos((i-1)*κ) for i=2:ord) for κ=κ])
 end
 const pars = copy(pars_raw)
 if mode == "cep"
-    const cep = 2π.*Base.rand(N_pars) |> cu
-    const chp = 2.0 .*(-1.0 .+ 2.0 .* CUDA.rand(N_pars)) |> CuArray{Float64}#vcat(1.0 .+ 1.0 .* CUDA.rand(N_pars), -1.0 .- 1.0 .* CUDA.rand(N_pars))[1:2:end]
-    const cbp = 1.0 .*(-1.0 .+ 2.0 .* CUDA.rand(N_pars)) |> CuArray{Float64}#(-1.0 .+ 2.0 .* CUDA.rand(N_pars)).*0.5#2.0
+    const cep = 2π.*Base.rand(N_pars) |> cu #unknown CEP is generated randomly
+    const chp = 2.0 .*(-1.0 .+ 2.0 .* CUDA.rand(N_pars)) |> CuArray{Float64} #chirp parameter
+    const cbp = 1.0 .*(-1.0 .+ 2.0 .* CUDA.rand(N_pars)) |> CuArray{Float64} #cubic phase parameter
 else
     const cep = CUDA.zeros(N_pars)
 end
@@ -174,7 +171,7 @@ const Htr = cu(htr)
 
 const freqs = (2π/Ts[end]).*collect(0:div(length(Ts), 2))
 
-const ν = 4
+const ν = 4 #number of substeps within each intermediate integration
 
 function statsimkern!(cbp, chp, cep, js, hts, htr, ::Val{Z}, ::Val{ORD}, ::Val{ν}, exc) where {Z} where {ORD}
     k_id = threadIdx().x
@@ -283,7 +280,7 @@ function statsimkern!(cbp, chp, cep, js, hts, htr, ::Val{Z}, ::Val{ORD}, ::Val{�
                     cθ2 = CUDA.sqrt((1f0+cθ)*0.5f0)
                     sθ2 = CUDA.sqrt((1f0-cθ)*0.5f0)
 
-                    @inbounds U[1,1] = -cθ2#-cθ2
+                    @inbounds U[1,1] = -cθ2 #eigenbasis computation
                     @inbounds U[1,2] = sθ2
                     @inbounds U[2,1] = sθ2*eϕ
                     @inbounds U[2,2] = cθ2*eϕ
@@ -330,7 +327,7 @@ out_Js = zeros(Float64, length(Ts), Nf)
     Array(out_J)
 end
 
-df = Dates.format(now(), "ddmm_HHMM")
+df = Dates.format(now(), "ddmm_HHMM") #label of the output file
 
 rfft_plan = plan_rfft(out_J, 1)
 
