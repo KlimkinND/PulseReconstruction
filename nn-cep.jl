@@ -1,21 +1,19 @@
 using Flux, CUDA, JLD2, Random, Statistics, LinearAlgebra, FFTW, ProgressMeter
-
 using Flux: @epochs, train!, throttle
-
 using ProgressMeter
 
 const batch_size = 512
 const aug_step = 22
 
-cubic = true
-chirp = true
-augment = true
+cubic = true #true if the measured pulses have a cubic phase
+chirp = true #true if the measured pulses have a chirp
+augment = true #true if the data is to be augmented
 ssh = false
-corr_pars = !ssh
+corr_pars = !ssh #if true, the first parameter resolved by NN is the true band gap; if false, t[0]
 
-learn_pars = true
+learn_pars = true #false if the network doesn't have to resolve the crystal bands
 
-prefix = "0110_2037"#"0809_0958"##"3007_2230"#"2906_1917"#"2004_1549"#""0809_0958"#
+prefix = #fill file label here
 file = jldopen("resps-cep-$prefix.jld2")
 
 cep = permutedims(file["cep"])
@@ -36,7 +34,6 @@ end
 
 exp_smp = (1:size(cep)[2])
 
-N_cycles = file["N"]
 data = file["data_freq"][:,:,exp_smp]
 N_pars = size(data)[3]
 pars = ssh ? permutedims(hcat(file["delta"], file["h1"], file["h2"]))[:, exp_smp] : file["pars"][:,exp_smp]
@@ -122,8 +119,8 @@ else
 end
 
 data_y = pars_aug
-data_yφ = vcat(cos.(cep_aug), sin.(cep_aug), eval.([:chp_aug, :cbp_aug][BitArray([chirp, cubic])])...) #: vcat(cos.(cep_aug), sin.(cep_aug))
-data_yφ_tst = vcat(cos.(cep_tst), sin.(cep_tst), eval.([:chp_tst, :cbp_tst][BitArray([chirp, cubic])])...) #: vcat(cos.(cep_tst), sin.(cep_tst))
+data_yφ = vcat(cos.(cep_aug), sin.(cep_aug), eval.([:chp_aug, :cbp_aug][BitArray([chirp, cubic])])...)
+data_yφ_tst = vcat(cos.(cep_tst), sin.(cep_tst), eval.([:chp_tst, :cbp_tst][BitArray([chirp, cubic])])...)
 
 ws = vcat(ones(ord), 0.01.*ones(2)) |> gpu
 
@@ -210,7 +207,7 @@ pars_infd = cpu(M_pars(test_data_p[1]))
 Δ = pars_eval .- pars_infd
 Δ_rel = (pars_infd .- pars_eval)./pars_eval
 
-#display(collect(zip(pars_eval[:, 1:7], pars_infd[:, 1:7])))
+#display(collect(zip(pars_eval[:, 1:7], pars_infd[:, 1:7]))) #uncomment to show examples of the NN's band recovery
 
 println("Absolute parameter errors:")
 println(round.(vec(std(Δ, dims=2)), digits=3))
@@ -225,7 +222,7 @@ cep_infd = phi(M_cep(test_data_cep[1])) |> cpu
 nrms = mapslices(norm, cep_infd, dims=1)
 cep_infd .= cep_infd./nrms
 
-#display(collect(zip(cep_eval[:, 1:7], cep_infd[:, 1:7])))
+#display(collect(zip(cep_eval[:, 1:7], cep_infd[:, 1:7]))) #uncomment to show examples of the NN's CEP recovery
 
 cθ = diag(cep_eval'cep_infd)
 δφ = sqrt(2*mean(1.0 .- cθ))
