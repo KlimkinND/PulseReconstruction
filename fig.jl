@@ -32,7 +32,7 @@ function f(eiφ, β, ϵ, z)
     exparg = sq3(2/λ)*(z + μ^2 /2λ) |> ComplexF64
     corr = (1//3)*μ^3/λ^2 +z*μ/λ
     if abs(corr) < 400
-        ret = cutf(-z)*cutf(z)*2*sqrt(π)*abs(sqrt(μ/2))*abs(2/λ)^(1//3)*airyai(exparg)*exp(corr) #*exp(-z^2 /2μ)
+        ret = cutf(-z)*cutf(z)*2*sqrt(π)*abs(sqrt(μ/2))*abs(2/λ)^(1//3)*airyai(exparg)*exp(corr)
     else
         ret = cutf(-z)*cutf(z)*exp(-1im*angle(μ)/2)*exp(-z^2/(2μ))
     end
@@ -49,7 +49,7 @@ clrs = distinguishable_colors(2, colorant"blue", lchoices=range(0, stop=50, leng
 p1 = [begin
     ω = src[i]["omega0"]
     φ = src[i]["phi"]
-    data = imfilter(res[i]["data_tst"][:,:,ind[i]], Kernel.gaussian(1)) #
+    data = imfilter(res[i]["data_tst"][:,:,ind[i]], Kernel.gaussian(1)) 
     plot(φ, (0:size(data)[1]-1), log10.(data), xlabel="CEP change, rad", ylabel=(i==1 ? "Harmonic number" : ""), colorbar=(i==3), colorbar_title="Harmonic yield, log scale", legend=false, tickfontsize=12, seriestype=:heatmap, thickness_scaling=2, clims=clims)
 end
 for i=1:3]
