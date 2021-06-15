@@ -20,6 +20,8 @@ const t0 = T*N_cycles/2 #pulse peak time
 const Tmax = N_cycles*T
 const z = 2
 
+const δφ = 0.2 #the experimental uncertainty of CEP; varies randomly for each pulse
+
 const Nk = 32 #number of k-points in the Brillouin zone
 const Nf = 64 #number of delay phases for which the responses are measured
 const hmax = 40 #maximum harmonic number measured
@@ -44,39 +46,40 @@ function airy_asym(y::ComplexF64, n::Int, corr::ComplexF64 = zero(ComplexF64)) #
     ret = 0.0
     if CUDA.abs(CUDA.angle(y)) < 2π/3
         z = y |> ComplexF64
-        ζ = (2/3)*cupow(z, 1.5)
+        ζ = (2/3)*(z^(3/2))
         cf = zero(ComplexF64)
         u = one(Float64)
         for k=0:n
-            cf += cupow(-1/ζ, Float64(k)) * u
+            cf += (-1/ζ)^k * u
             u *= (6k+5)*(6k+3)*(6k+1)/((2k+1)*216*(k+1))
         end
         ret = cf*CUDA.exp(-ζ+corr)/2
     else
         z = -y |> ComplexF64
-        ζ = (2/3)*cupow(z, 3/2)
+        ζ = (2/3)*z^(3/2)
         cf_c = zero(ComplexF64)
         cf_s = zero(ComplexF64)
         u = 1.0
         for k=0:n
             if k%2 == 0
-                cf_c += CUDA.pow(-1.0, k/2.0) / cupow(ζ, Float64(k)) * u
+                cf_c += (-1.0)^(k/2.0) / (ζ^k) * u
             else
-                cf_s += CUDA.pow(-1.0, (k-1.0)/2.0) / cupow(ζ, Float64(k)) * u
+                cf_s += (-1.0)^((k-1.0)/2.0) / (ζ^k) * u
             end
             u *= (6k+5)*(6k+3)*(6k+1)/((2k+1)*216*(k+1))
         end
-        ret = CUDA.exp(corr)*(cf_c*cucos(ζ-π/4) + cf_s*cusin(ζ-π/4))
+        ret = CUDA.exp(corr)*(cf_c*CUDA.cos(ζ-π/4) + cf_s*CUDA.sin(ζ-π/4))
     end
-    return ret/(sqrt(π)*cupow(z, 0.25))
+    return ret/(sqrt(π)*z^(1/4))
 end
 
 function airy_taylor(z::ComplexF64, n::Int=40) #see DLMF 9.4.1 https://dlmf.nist.gov/9.4
     cf = 0
+    spc = 3.0^(1/3)
     for k = 0:n
-        cf += CUDA.exp(CUDA.lgamma((k+1.0)/3) - CUDA.lgamma(k+1.0))*CUDA.sinpi(2*(k+1.0)/3)*cupow(CUDA.pow(3.0, 1/3)*z, Float64(k))
+        cf += CUDA.exp(CUDA.lgamma((k+1.0)/3) - CUDA.lgamma(k+1.0))*CUDA.sinpi(2*(k+1.0)/3)*((spc*z)^k)
     end
-    return (1.0/(CUDA.pow(3.0, 2/3)*π))*cf
+    return (1.0/(spc^2 * π))*cf
 end
 
 function airy_gpu(z::ComplexF64, corr::ComplexF64, n1::Int64=20, n2::Int=1, r::Float64=2.5) #default parameters yield inaccurate results; redefined manually in EF
@@ -87,7 +90,7 @@ function airy_gpu(z::ComplexF64, corr::ComplexF64, n1::Int64=20, n2::Int=1, r::F
     end
 end
 
-cusq3(x) = CUDA.sign(x)*CUDA.pow(CUDA.abs(x), 1.0/3)
+cusq3(x) = CUDA.sign(x)*(CUDA.abs(x)^(1.0/3))
 
 if mode == "2h"
     EF(t) = 1.0 - smclamp((t-(maxint+fwhm/4))/(fwhm/2), 0.0, 1.0) - smclamp(-(t-(maxint-fwhm/4))/(fwhm/2), 0.0, 1.0)
@@ -103,7 +106,7 @@ elseif mode == "cep"
         exparg = cusq3(2/λ)*(z + μ^2 /2λ) |> ComplexF64
         corr = (1/3)*μ^3/λ^2 +z*μ/λ
         if CUDA.abs(corr) < 400
-            return 2*sqrt(π)*CUDA.abs(cusqrt(μ/2))*CUDA.pow(abs(2/λ), 1.0/3)*airy_gpu(exparg, corr, 25, 5, 3.5) #*exp(-z^2 /2μ)
+            return 2*sqrt(π)*CUDA.abs(cusqrt(μ/2))*(abs(2/λ)^(1.0/3))*airy_gpu(exparg, corr, 25, 5, 3.5) #*exp(-z^2 /2μ)
         else
             return CUDA.exp(-1im*CUDA.angle(μ)/2)*CUDA.exp(-z^2/(2μ))
         end
@@ -121,7 +124,7 @@ const ρ0 = (x = zeros(ComplexF64, z, z); x[1, 1] = 1.0; x) |> cu
 const idm = ComplexF64.(Matrix(I, z, z))
 const hid = ρ0
 
-const N_pars = 2^18 #number of samples to be generated
+const N_pars = 2^16 #number of samples to be generated
 const ord = 4 #maximum hopping order
 const pars_bsl = [4.0, -1.0, 1.5, 1.0, 0.5, 0.5][1:ord]
 const pars_spr = [4.0, -5.0, -3.0, -2.0, -1.0, -1.0][1:ord] #parameter t[i] ranges from pars_bsl[i] to pars_bsl[i]+pars_spr[i]
@@ -136,9 +139,9 @@ Threads.@threads for j=1:N_pars
 end
 const pars = copy(pars_raw)
 if mode == "cep"
-    const cep = 2π.*Base.rand(N_pars) |> cu #unknown CEP is generated randomly
-    const chp = 2.0 .*(-1.0 .+ 2.0 .* CUDA.rand(N_pars)) |> CuArray{Float64} #chirp parameter
-    const cbp = 1.0 .*(-1.0 .+ 2.0 .* CUDA.rand(N_pars)) |> CuArray{Float64} #cubic phase parameter
+    const cep = 2π.*Base.rand(N_pars) |> CuArray{Float64} #unknown CEP is generated randomly
+    const chp = 0.0 .*(-1.0 .+ 2.0 .* CUDA.rand(N_pars)) |> CuArray{Float64} #chirp parameter
+    const cbp = 0.0 .*(-1.0 .+ 2.0 .* CUDA.rand(N_pars)) |> CuArray{Float64} #cubic phase parameter
 else
     const cep = CUDA.zeros(N_pars)
 end
@@ -166,14 +169,14 @@ else
     end
 end
 
-const Ht = cu(ht)
-const Htr = cu(htr)
+const Ht = CuArray{ComplexF64}(ht)
+const Htr = CuArray{ComplexF64}(htr)
 
 const freqs = (2π/Ts[end]).*collect(0:div(length(Ts), 2))
 
 const ν = 4 #number of substeps within each intermediate integration
 
-function statsimkern!(cbp, chp, cep, js, hts, htr, ::Val{Z}, ::Val{ORD}, ::Val{ν}, exc) where {Z} where {ORD}
+function statsimkern!(cbp, chp, cep, dphi, js, hts, htr, ::Val{Z}, ::Val{ORD}, ::Val{ν}, exc) where {Z} where {ORD}
     k_id = threadIdx().x
     k_stride = blockDim().x
     φ_id = threadIdx().y
@@ -204,7 +207,7 @@ function statsimkern!(cbp, chp, cep, js, hts, htr, ::Val{Z}, ::Val{ORD}, ::Val{�
     if exc
         for i=k_id:k_stride:Nk, j=φ_id:φ_stride:Nf, q=block_id:block_stride:chunk_size
             @inbounds k = K[i]
-            @inbounds φ = cep[q] + Φ[j]
+            @inbounds φ = cep[q] + Φ[j] + dphi[j, q]
             @inbounds α = chp[q]
             @inbounds λ = cbp[q]
 
@@ -321,9 +324,10 @@ const inds = Iterators.partition(1:N_pars, chunk_size)
 out_J = CUDA.zeros(Float64, length(Ts), Nf, chunk_size)
 
 out_Js = zeros(Float64, length(Ts), Nf)
+dφ = CUDA.zeros(Float64, Nf, chunk_size)
 
 @time begin
-    @cuda threads=(1, 1) blocks=1 statsimkern!(cbp, chp, cep, out_J, Ht, Htr, Val(2), Val(ord), Val(ν), false);
+    @cuda threads=(1, 1) blocks=1 statsimkern!(cbp, chp, cep, dφ, out_J, Ht, Htr, Val(2), Val(ord), Val(ν), false);
     Array(out_J)
 end
 
@@ -333,7 +337,11 @@ rfft_plan = plan_rfft(out_J, 1)
 
 @showprogress for (j, ind)=enumerate(inds)
     fill!(out_J, 0.0)
-    @sync @cuda threads=(8, 8) blocks=512 statsimkern!(cbp[ind], chp[ind], cep[ind], out_J, Ht[:,:,:,ind], Htr[:,:,:,ind], Val(2), Val(ord), Val(ν), true);
+
+    CUDA.rand!(dφ)
+    dφ .= δφ.*(2.0.*dφ .- 1.0)
+
+    @sync @cuda threads=(8, 8) blocks=512 statsimkern!(cbp[ind], chp[ind], cep[ind], dφ, out_J, Ht[:,:,:,ind], Htr[:,:,:,ind], Val(2), Val(ord), Val(ν), true);
     (j == 1) && (out_Js .= Array(@view(out_J[:,:,1])))
     mul!(out_Jωc, rfft_plan, out_J)
     @view(out_Jω[:,:,ind]) .= abs.(Array(@view(out_Jωc[1:N_cycles:end, :, :])))
